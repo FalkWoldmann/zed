@@ -1314,6 +1314,13 @@ pub struct Thread {
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    /// Whether a request since the latest compaction reported usage below the
+    /// auto-compaction threshold. Usage is keyed by the turn's user message,
+    /// which precedes a mid-turn compaction, so message order alone can't tell
+    /// fresh usage from the stale pre-compaction usage. And if a compaction
+    /// couldn't bring the context under the threshold, another one in the same
+    /// turn wouldn't either.
+    context_below_threshold_since_compaction: bool,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1462,6 +1469,7 @@ impl Thread {
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
+            context_below_threshold_since_compaction: false,
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1841,6 +1849,7 @@ impl Thread {
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
+            context_below_threshold_since_compaction: false,
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -2433,6 +2442,11 @@ impl Thread {
 
         self.request_token_usage
             .insert(last_user_message.id.clone(), update);
+        if self.auto_compaction_threshold(cx).is_some_and(|threshold| {
+            total_input_tokens(update).saturating_add(update.output_tokens) < threshold
+        }) {
+            self.context_below_threshold_since_compaction = true;
+        }
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -2485,6 +2499,7 @@ impl Thread {
                 Message::Agent(_) | Message::Resume | Message::Compaction(_) => {}
             }
         }
+        self.context_below_threshold_since_compaction = false;
         self.clear_summary();
         cx.notify();
         Ok(())
@@ -2810,7 +2825,10 @@ impl Thread {
                         match error.downcast::<CompletionError>() {
                             Ok(CompletionError::Refusal) => {
                                 event_stream.send_stop(acp::StopReason::Refusal);
-                                _ = this.update(cx, |this, _| this.messages.truncate(message_ix));
+                                _ = this.update(cx, |this, _| {
+                                    this.messages.truncate(message_ix);
+                                    this.context_below_threshold_since_compaction = false;
+                                });
                             }
                             Ok(CompletionError::MaxTokens) => {
                                 event_stream.send_stop(acp::StopReason::MaxTokens);
@@ -3364,6 +3382,7 @@ impl Thread {
                         this.messages.push(compaction);
                     }
                 }
+                this.context_below_threshold_since_compaction = false;
                 cx.notify();
             })?;
 
@@ -4532,13 +4551,20 @@ impl Thread {
         }
     }
 
+    fn auto_compaction_threshold(&self, cx: &App) -> Option<u64> {
+        let max_input_tokens = self.input_token_capacity()?;
+        Some(auto_compact_threshold_token_count(
+            AgentSettings::get_global(cx).auto_compact.threshold,
+            max_input_tokens,
+        ))
+    }
+
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
         if !self.auto_compaction_enabled(cx) {
             return None;
         }
 
-        let auto_compact = AgentSettings::get_global(cx).auto_compact;
-        let max_input_tokens = self.input_token_capacity()?;
+        let compaction_threshold = self.auto_compaction_threshold(cx)?;
         let (usage_ix, usage) = {
             let this = &self;
             this.messages
@@ -4555,15 +4581,14 @@ impl Thread {
                         .map(|usage| (ix, usage))
                 })
         }?;
-        if latest_compaction_message_ix_before(&self.messages, self.messages.len())
-            .is_some_and(|compaction_ix| compaction_ix > usage_ix)
+        if !self.context_below_threshold_since_compaction
+            && latest_compaction_message_ix_before(&self.messages, self.messages.len())
+                .is_some_and(|compaction_ix| compaction_ix > usage_ix)
         {
             return None;
         }
 
         let active_tokens = total_input_tokens(usage).saturating_add(usage.output_tokens);
-        let compaction_threshold =
-            auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
         if active_tokens < compaction_threshold {
             return None;
         }
@@ -7738,6 +7763,153 @@ mod tests {
                     Message::Compaction(CompactionInfo::Summary(summary)) if summary.as_ref() == "compacted old context"
                 ));
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_mid_turn_compaction_repeats_once_usage_drops_below_threshold(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let user_message_id = ClientUserMessageId::new();
+        let high_usage = language_model::TokenUsage {
+            input_tokens: 960_000,
+            ..Default::default()
+        };
+        let low_usage = language_model::TokenUsage {
+            input_tokens: 100_000,
+            ..Default::default()
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(user_message_id.clone(), "user"));
+                thread.messages.push(agent_text_message("assistant"));
+                thread
+                    .request_token_usage
+                    .insert(user_message_id, high_usage);
+                thread
+                    .messages
+                    .push(summary_compaction("compacted old context"));
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+
+                thread.messages.push(agent_text_message("more work"));
+                thread.update_token_usage(high_usage, cx);
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
+
+                thread.update_token_usage(low_usage, cx);
+                thread.update_token_usage(high_usage, cx);
+                assert_eq!(thread.compaction_message_target_ix(cx), Some(4));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refused_turn_discards_usage_reported_after_compaction(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let old_user_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.request_token_usage.insert(
+                    old_user_message_id,
+                    language_model::TokenUsage {
+                        input_tokens: 960_000,
+                        ..Default::default()
+                    },
+                );
+                thread
+                    .messages
+                    .push(summary_compaction("compacted old context"));
+            });
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["refused prompt"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request = fake.pending_completions().pop().unwrap();
+        assert_eq!(request.intent, Some(CompletionIntent::UserPrompt));
+        fake.send_event(
+            &model,
+            &request,
+            LanguageModelCompletionEvent::UsageUpdate(language_model::TokenUsage {
+                input_tokens: 100_000,
+                ..Default::default()
+            }),
+        );
+        fake.send_event(
+            &model,
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::Refusal),
+        );
+        fake.end_stream(&model, &request);
+        cx.run_until_parked();
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["next prompt"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request = fake.pending_completions().pop().unwrap();
+        assert_eq!(request.intent, Some(CompletionIntent::UserPrompt));
+    }
+
+    #[gpui::test]
+    async fn test_truncate_discards_usage_reported_after_compaction(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let old_user_message_id = ClientUserMessageId::new();
+        let new_user_message_id = ClientUserMessageId::new();
+        let usage = language_model::TokenUsage {
+            input_tokens: 960_000,
+            ..Default::default()
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread
+                    .request_token_usage
+                    .insert(old_user_message_id, usage);
+                thread
+                    .messages
+                    .push(summary_compaction("compacted old context"));
+                thread
+                    .messages
+                    .push(user_text_message(new_user_message_id.clone(), "new user"));
+                thread.update_token_usage(
+                    language_model::TokenUsage {
+                        input_tokens: 100_000,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+
+                thread.truncate(new_user_message_id, cx).unwrap();
+                assert_eq!(thread.compaction_message_target_ix(cx), None);
             });
         });
     }

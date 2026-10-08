@@ -7221,6 +7221,122 @@ async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_auto_compaction_repeats_within_turn(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("subagent task prompt", cx);
+
+    test.tool_round(900_000, cx);
+    let request = test.compaction_request();
+    test.fake.send_text(&test.model, &request, "first summary");
+    test.fake.end_stream(&test.model, &request);
+    cx.run_until_parked();
+
+    test.tool_round(100_000, cx);
+    let request = test.fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+
+    test.tool_round(900_000, cx);
+    let request = test.compaction_request();
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>(),
+        vec![
+            "subagent task prompt",
+            "The previous conversation was compacted. Use this summary as context:\n\nfirst summary",
+            "partial work",
+            "tool output",
+            "partial work",
+            "tool output",
+            COMPACTION_PROMPT,
+        ],
+    );
+    test.fake.send_text(&test.model, &request, "second summary");
+    test.fake.end_stream(&test.model, &request);
+    cx.run_until_parked();
+
+    let request = test.fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .map(|message| message.string_contents())
+            .collect::<Vec<_>>(),
+        vec![
+            "subagent task prompt",
+            "The previous conversation was compacted. Use this summary as context:\n\nsecond summary",
+        ],
+    );
+    test.fake
+        .send_text(&test.model, &request, "subagent answer");
+    test.fake.end_stream(&test.model, &request);
+    assert_eq!(send.await.unwrap(), "subagent answer");
+}
+
+#[gpui::test]
+async fn test_auto_compaction_not_repeated_when_it_does_not_reduce_context(
+    cx: &mut TestAppContext,
+) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("subagent task prompt", cx);
+
+    test.tool_round(900_000, cx);
+    let request = test.compaction_request();
+    test.fake.send_text(&test.model, &request, "summary");
+    test.fake.end_stream(&test.model, &request);
+    cx.run_until_parked();
+
+    test.tool_round(950_000, cx);
+    let request = test.fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+    test.fake
+        .send_text(&test.model, &request, "subagent answer");
+    test.fake.end_stream(&test.model, &request);
+    assert_eq!(send.await.unwrap(), "subagent answer");
+}
+
+#[gpui::test]
+async fn test_retry_after_auto_compaction_does_not_compact_again(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let _send = test.send("subagent task prompt", cx);
+
+    test.tool_round(100_000, cx);
+    test.tool_round(900_000, cx);
+    let request = test.compaction_request();
+    test.fake.send_text(&test.model, &request, "summary");
+    test.fake.end_stream(&test.model, &request);
+    cx.run_until_parked();
+
+    let request = test.fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+    test.fake.send_error(
+        &test.model,
+        &request,
+        LanguageModelCompletionError::from_http_status(
+            LanguageModelProviderName::new("test"),
+            http_client::StatusCode::SERVICE_UNAVAILABLE,
+            "provider error".to_string(),
+            Some(Duration::from_secs(3)),
+        ),
+    );
+    test.fake.end_stream(&test.model, &request);
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::maximum_retry_delay_with_jitter(Duration::from_secs(
+            3,
+        )));
+    cx.run_until_parked();
+
+    let request = test.fake.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+}
+
+#[gpui::test]
 async fn test_subagent_compaction_respects_settings_and_context_window(cx: &mut TestAppContext) {
     for (enabled, max_tokens, max_output_tokens, input_tokens) in [
         (true, 1_000_000, None, 899_999),
